@@ -317,6 +317,122 @@ router.get("/:id/recipients", async (req, res) => {
 });
 
 /**
+ * POST /api/campaigns/:id/retry
+ * Resend/retry failed messages for a campaign, optionally filtered by category
+ */
+router.post("/:id/retry", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { category, messageIds } = req.body || {};
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "Invalid campaign ID format." });
+    }
+
+    const campaignResult = await db.query(`SELECT * FROM campaigns WHERE id = $1`, [id]);
+    if (campaignResult.rows.length === 0) {
+      return res.status(404).json({ error: "Campaign not found" });
+    }
+    const campaign = campaignResult.rows[0];
+
+    // Fetch failed messages
+    let query = `
+      SELECT m.id as message_id, m.contact_id, m.error_message, c.phone_number, c.name, c.city
+      FROM messages m
+      JOIN contacts c ON m.contact_id = c.id
+      WHERE m.campaign_id = $1 AND m.status = 'failed'
+    `;
+    const params = [id];
+
+    if (Array.isArray(messageIds) && messageIds.length > 0) {
+      const validIds = messageIds.filter(isValidUuid);
+      if (validIds.length > 0) {
+        query += ` AND m.id = ANY($2::uuid[])`;
+        params.push(validIds);
+      }
+    }
+
+    const failedMessagesResult = await db.query(query, params);
+    let failedRows = failedMessagesResult.rows;
+
+    // Filter by category if specified
+    if (category === "not-on-whatsapp") {
+      failedRows = failedRows.filter(r => r.error_message && r.error_message.toLowerCase().includes("undeliverable"));
+    } else if (category === "spam-filtered") {
+      failedRows = failedRows.filter(r => r.error_message && r.error_message.toLowerCase().includes("ecosystem"));
+    } else if (category === "other-failed") {
+      failedRows = failedRows.filter(r => {
+        const err = (r.error_message || "").toLowerCase();
+        return !err.includes("undeliverable") && !err.includes("ecosystem");
+      });
+    }
+
+    if (failedRows.length === 0) {
+      return res.status(400).json({ error: "No matching failed recipients found to retry." });
+    }
+
+    // Inspect template to get paramCount and resolvedLanguageCode
+    let paramCount = 0;
+    let resolvedLanguageCode = "en_US";
+    try {
+      const templates = await getTemplates();
+      const tpl = (templates || []).find((t) => t.name === campaign.template_name?.trim());
+      if (tpl) {
+        if (tpl.language) resolvedLanguageCode = tpl.language;
+        if (tpl.components) {
+          const bodyComponent = tpl.components.find((c) => c.type === "BODY");
+          if (bodyComponent && bodyComponent.text) {
+            const matches = bodyComponent.text.match(/\{\{\d+\}\}/g);
+            if (matches) paramCount = matches.length;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Template fetch during retry:", e.message);
+    }
+
+    // Remove the old failed message records so fresh records get created
+    const idsToDelete = failedRows.map(r => r.message_id);
+    await db.query(`DELETE FROM messages WHERE id = ANY($1::uuid[])`, [idsToDelete]);
+
+    const messages = failedRows.map((member) => {
+      const bodyParams = [];
+      if (paramCount >= 1) bodyParams.push({ type: "text", text: member.name || "Customer" });
+      if (paramCount >= 2) bodyParams.push({ type: "text", text: member.city || "Valued Client" });
+      for (let i = 2; i < paramCount; i++) bodyParams.push({ type: "text", text: "Update" });
+
+      const sanitizedPhone = member.phone_number ? String(member.phone_number).replace(/\D/g, "") : "";
+      return {
+        to: sanitizedPhone,
+        contactId: member.contact_id,
+        bodyParams,
+      };
+    });
+
+    const io = req.app.get("io");
+    await processCampaign(
+      messages,
+      campaign.id,
+      campaign.template_name.trim(),
+      resolvedLanguageCode,
+      io,
+      campaign.media_id,
+      campaign.media_type,
+      campaign.media_url
+    );
+
+    res.json({
+      success: true,
+      retriedCount: messages.length,
+      message: `Resending ${messages.length} messages...`,
+    });
+  } catch (err) {
+    console.error("❌ Retry campaign error:", err);
+    res.status(500).json({ error: "Failed to retry campaign messages." });
+  }
+});
+
+/**
  * DELETE /api/campaigns/:id
  * Delete campaign and associated messages
  */
