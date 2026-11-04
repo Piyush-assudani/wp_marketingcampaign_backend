@@ -7,6 +7,7 @@ const { uploadFileToCloudinary } = require("../services/cloudinaryService");
 const os = require("os");
 const path = require("path");
 const { uploadMediaToMeta, getTemplates } = require("../services/metaApi");
+const XLSX = require("xlsx");
 
 const isValidUuid = (val) =>
   typeof val === "string" &&
@@ -313,6 +314,99 @@ router.get("/:id/recipients", async (req, res) => {
   } catch (err) {
     console.error("❌ Campaign recipients error:", err);
     res.status(500).json({ error: "Failed to fetch campaign recipient list." });
+  }
+});
+
+/**
+ * GET /api/campaigns/:id/export
+ * Export all campaign recipient delivery data to Excel (.xlsx)
+ */
+router.get("/:id/export", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "Invalid campaign ID format." });
+    }
+
+    const campaignResult = await db.query(`SELECT * FROM campaigns WHERE id = $1`, [id]);
+    if (campaignResult.rows.length === 0) {
+      return res.status(404).json({ error: "Campaign not found" });
+    }
+    const campaign = campaignResult.rows[0];
+
+    const result = await db.query(
+      `SELECT c.name, c.phone_number, m.status, m.error_message, m.timestamp
+       FROM messages m
+       JOIN contacts c ON m.contact_id = c.id
+       WHERE m.campaign_id = $1
+       ORDER BY m.timestamp DESC`,
+      [id]
+    );
+
+    const rows = result.rows.map((r, index) => {
+      let derivedStatus = r.status || "Unknown";
+      let errorCategory = "None";
+
+      if (r.status === "failed") {
+        const err = (r.error_message || "").toLowerCase();
+        if (err.includes("undeliverable")) {
+          derivedStatus = "Not on WhatsApp";
+          errorCategory = "Not on WhatsApp (Undeliverable)";
+        } else if (err.includes("ecosystem")) {
+          derivedStatus = "Spam / Rate-limit Filtered";
+          errorCategory = "Spam / Ecosystem Protection";
+        } else {
+          derivedStatus = "Failed";
+          errorCategory = "Meta API Error";
+        }
+      } else if (r.status === "read") {
+        derivedStatus = "Read";
+      } else if (r.status === "delivered") {
+        derivedStatus = "Delivered";
+      } else if (r.status === "sent") {
+        derivedStatus = "Sent";
+      }
+
+      return {
+        "S.No": index + 1,
+        "Recipient Name": r.name || "Unknown",
+        "Phone Number": `+${r.phone_number}`,
+        "Status": derivedStatus,
+        "Error Category": errorCategory,
+        "Error Details": r.error_message || "",
+        "Sent Date & Time": r.timestamp ? new Date(r.timestamp).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "",
+        "Campaign Name": campaign.name,
+        "Template Name": campaign.template_name,
+      };
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    worksheet["!cols"] = [
+      { wch: 6 },
+      { wch: 22 },
+      { wch: 18 },
+      { wch: 18 },
+      { wch: 28 },
+      { wch: 45 },
+      { wch: 24 },
+      { wch: 22 },
+      { wch: 20 },
+    ];
+
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Campaign Report");
+
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+
+    const safeFilename = `${(campaign.name || "campaign").replace(/[^a-zA-Z0-9_-]/g, "_")}_Report.xlsx`;
+
+    res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.send(buffer);
+  } catch (err) {
+    console.error("❌ Campaign export error:", err);
+    res.status(500).json({ error: "Failed to export campaign data." });
   }
 });
 
